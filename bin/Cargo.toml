@@ -1,0 +1,9 @@
+[package]
+name = "oauth_decap_github"
+version = "0.0.1"
+edition = "2021"
+
+[dependencies]
+axum = "0.7"
+oauth_decap_github_lib = { path = "../lib/" }
+tokio = { version = "1", features=["full"] }
