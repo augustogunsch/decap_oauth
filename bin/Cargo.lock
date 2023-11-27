@@ -787,9 +787,9 @@ dependencies = [
 
 [[package]]
 name = "oauth_decap_github_lib"
-version = "0.0.4"
+version = "0.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b365e92750a14acdae86e209c9bf1d6887980f1825c32d8660e5d7960d5465b5"
+checksum = "f9b2bd83859b9520bd061b95f0a85e3d896971d8fb024387620c8d1122345d1c"
 dependencies = [
  "axum",
  "oauth2",
