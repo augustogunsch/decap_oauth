@@ -1,7 +1,8 @@
-//! Decap CMS OAuth provider for GitHub.
-//! The following environment variables must be set for it to work properly:
-//! `CLIENT_ID`  and `SECRET`. For instructions on how to set up an OAuth app and get these values, refer to
-//! [GitHub's documentation](https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/creating-an-oauth-app).
+//! Decap CMS OAuth provider for GitHub. The following environment variables must be set for it to
+//! work properly: `ORIGIN`, `CLIENT_ID`  and `SECRET`. For instructions on how to set up an OAuth
+//! app and get `CLIENT_ID` and `SECRET`, refer to [GitHub's
+//! documentation](https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/creating-an-oauth-app).
+
 use axum::{
     extract::Query,
     http::{HeaderMap, StatusCode},
@@ -76,10 +77,17 @@ pub async fn auth(Query(params): Query<HashMap<String, String>>, headers: Header
 }
 
 fn login_response(provider: &str, status: &str, token: &AccessToken) -> Html<String> {
+    let origin = env::var("ORIGIN").expect("ORIGIN env variable should be defined");
+
     Html(format!(
         r#"
     <script>
       const receiveMessage = (message) => {{
+        if (!e.origin.match('{}')) {{
+          console.log('Invalid origin: %s', e.origin);
+          return;
+        }}
+
         window.opener.postMessage(
           'authorization:{}:{}:{{"token":"{}","provider":"{}"}}',
           message.origin
@@ -92,6 +100,7 @@ fn login_response(provider: &str, status: &str, token: &AccessToken) -> Html<Str
       window.opener.postMessage("authorizing:{}", "*");
     </script>
     "#,
+        origin,
         provider,
         status,
         token.secret(),

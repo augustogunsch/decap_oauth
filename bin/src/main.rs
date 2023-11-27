@@ -16,6 +16,11 @@ async fn main() {
         exit(1);
     }
 
+    if let Err(_) = env::var("ORIGIN") {
+        eprintln!("error: undefined environment variable `ORIGIN`.");
+        exit(1);
+    }
+
     let app = Router::new().merge(oauth_router());
 
     let listener = TcpListener::bind("0.0.0.0:3005").await.unwrap();
