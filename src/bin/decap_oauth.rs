@@ -1,5 +1,5 @@
 use axum::Router;
-use oauth_decap_github_lib::oauth_router;
+use decap_oauth::oauth_router;
 use std::env;
 use std::process::exit;
 use tokio::net::TcpListener;

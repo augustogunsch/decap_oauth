@@ -1,6 +1,6 @@
 [package]
-name = "oauth_decap_github_lib"
-version = "0.0.6"
+name = "decap_oauth"
+version = "0.0.1"
 edition = "2021"
 authors = ["Augusto Gunsch <augusto@augustogunsch>"]
 license = "MIT"
@@ -13,3 +13,4 @@ OAuth server for Decap CMS for GitHub.
 axum = "0.7"
 oauth2 = "4"
 reqwest = "0.11"
+tokio = { version = "1", features = ["full"] }

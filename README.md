@@ -5,4 +5,4 @@ refer to [GitHub's
 documentation](https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/creating-an-oauth-app).
 
 
-Documentation available on [docs.rs](https://docs.rs/oauth_decap_github_lib/latest/oauth_decap_github_lib/).
+Documentation available on [docs.rs](https://docs.rs/decap_oauth/latest/decap_oauth/).
