@@ -1,7 +1,24 @@
-//! Decap CMS OAuth provider for GitHub. The following environment variables must be set for it to
-//! work properly: `ORIGIN`, `CLIENT_ID`  and `SECRET`. For instructions on how to set up an OAuth
-//! app and get `CLIENT_ID` and `SECRET`, refer to [GitHub's
-//! documentation](https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/creating-an-oauth-app).
+//! External OAuth provider for Decap CMS. The following environment variables must be set for it to
+//! work:
+//!
+//! ```shell
+//! OAUTH_CLIENT_ID=(insert_the_client_id)
+//! OAUTH_SECRET=(insert_the_secret)
+//! OAUTH_ORIGINS=www.example.com,oauth.mysite.com
+//! ```
+//!
+//! Additionaly, when using a host provider other than GitHub, such as Gitlab, the following
+//! environment variables must be set:
+//!
+//! ```shell
+//! OAUTH_PROVIDER=gitlab
+//! OAUTH_HOSTNAME=https://gitlab.com
+//! OAUTH_TOKEN_PATH=/oauth/token
+//! OAUTH_AUTHORIZE_PATH=/oauth/authorize
+//! OAUTH_SCOPES=api
+//! ```
+//!
+//! When using GitHub Enterprise, please set `OAUTH_HOSTNAME` to the proper value.
 
 use axum::{
     extract::Query,
@@ -16,46 +33,66 @@ use oauth2::{
 use std::collections::HashMap;
 use std::env;
 
-const TOKEN_HOST: &str = "https://github.com";
-const TOKEN_PATH: &str = "/login/oauth/access_token";
-const AUTH_PATH: &str = "/login/oauth/authorize";
+const OAUTH_HOSTNAME: &str = "https://github.com";
+const OAUTH_TOKEN_PATH: &str = "/login/oauth/access_token";
+const OAUTH_AUTHORIZE_PATH: &str = "/login/oauth/authorize";
+const OAUTH_PROVIDER: &str = "github";
+const OAUTH_SCOPES: &str = "repo";
 
-fn create_client() -> BasicClient {
-    let client_id = env::var("CLIENT_ID").expect("CLIENT_ID env variable should be defined");
-    let secret = env::var("SECRET").expect("SECRET env variable should be defined");
+fn get_var(var: &str) -> String {
+    env::var(var).expect(format!("{} environment variable should be defined", var).as_str())
+}
+
+fn get_var_or(var: &str, default: &str) -> String {
+    env::var(var).unwrap_or(default.to_string())
+}
+
+fn create_client(redirect_url: String) -> BasicClient {
+    let client_id = get_var("OAUTH_CLIENT_ID");
+    let secret = get_var("OAUTH_SECRET");
+    let hostname = get_var_or("OAUTH_HOSTNAME", OAUTH_HOSTNAME);
+    let token_path = get_var_or("OAUTH_TOKEN_PATH", OAUTH_TOKEN_PATH);
+    let auth_path = get_var_or("OAUTH_AUTHORIZE_PATH", OAUTH_AUTHORIZE_PATH);
 
     BasicClient::new(
         ClientId::new(client_id),
         Some(ClientSecret::new(secret)),
-        AuthUrl::new(format!("{}{}", TOKEN_HOST, AUTH_PATH))
-            .expect("Auth URL should be a valid URL"),
+        AuthUrl::new(format!("{}{}", hostname, auth_path)).expect("Auth URL should be a valid URL"),
         Some(
-            TokenUrl::new(format!("{}{}", TOKEN_HOST, TOKEN_PATH))
+            TokenUrl::new(format!("{}{}", hostname, token_path))
                 .expect("Token URL should be a valid URL"),
         ),
     )
+    .set_redirect_uri(RedirectUrl::new(redirect_url).expect("Invalid redirect URL"))
 }
 
 /// The auth route.
 pub async fn auth(Query(params): Query<HashMap<String, String>>, headers: HeaderMap) -> Response {
+    let expected_provider = get_var_or("OAUTH_PROVIDER", OAUTH_PROVIDER);
+
     let provider = match params.get("provider") {
-        Some(provider) => provider,
-        None => {
-            return (StatusCode::BAD_REQUEST, "No provider specified".to_string()).into_response()
-        }
+        Some(provider) => provider.to_string(),
+        None => match env::var("OAUTH_PROVIDER") {
+            Ok(var) => var,
+            Err(_) => {
+                return (StatusCode::BAD_REQUEST, "No provider specified".to_string())
+                    .into_response()
+            }
+        },
     };
 
-    if provider != "github" {
+    // This check is not strictly needed
+    if provider != expected_provider {
         return (
             StatusCode::BAD_REQUEST,
-            format!("Invalid provider {:?}", provider),
+            format!("Unexpected provider `{}`", provider),
         )
             .into_response();
     }
 
     let scope = match params.get("scope") {
         Some(scope) => scope.to_owned(),
-        None => "repo".to_string(),
+        None => get_var_or("OAUTH_SCOPES", OAUTH_SCOPES),
     };
 
     let host = match headers.get("host") {
@@ -65,8 +102,7 @@ pub async fn auth(Query(params): Query<HashMap<String, String>>, headers: Header
 
     let redirect_url = format!("https://{}/callback?provider={}", host, provider);
 
-    let client = create_client()
-        .set_redirect_uri(RedirectUrl::new(redirect_url).expect("Invalid redirect URL"));
+    let client = create_client(redirect_url);
 
     let (auth_url, _csrf_state) = client
         .authorize_url(CsrfToken::new_random)
@@ -77,30 +113,38 @@ pub async fn auth(Query(params): Query<HashMap<String, String>>, headers: Header
 }
 
 fn login_response(provider: &str, status: &str, token: &AccessToken) -> Html<String> {
-    let origin = env::var("ORIGIN").expect("ORIGIN env variable should be defined");
+    let origins = get_var("OAUTH_ORIGINS");
 
     Html(format!(
         r#"
     <script>
-      const receiveMessage = (message) => {{
-        if (!e.origin.match('{}')) {{
-          console.log('Invalid origin: %s', e.origin);
+      const receiveMessage = (e) => {{
+        let matches = false;
+
+        for(const origin of '{}'.split(',')) {{
+          if (e.origin.match(origin)) {{
+              matches = true;
+              break;
+          }}
+        }}
+
+        if (!matches) {{
           return;
         }}
 
         window.opener.postMessage(
           'authorization:{}:{}:{{"token":"{}","provider":"{}"}}',
-          message.origin
+          e.origin
         );
 
-        window.removeEventListener("message", receiveMessage, false);
+        window.removeEventListener('message', receiveMessage, false);
       }}
-      window.addEventListener("message", receiveMessage, false);
+      window.addEventListener('message', receiveMessage, false);
 
-      window.opener.postMessage("authorizing:{}", "*");
+      window.opener.postMessage('authorizing:{}', '*');
     </script>
     "#,
-        origin,
+        origins,
         provider,
         status,
         token.secret(),
@@ -110,36 +154,45 @@ fn login_response(provider: &str, status: &str, token: &AccessToken) -> Html<Str
 }
 
 /// The callback route.
-pub async fn callback(Query(params): Query<HashMap<String, String>>) -> Response {
+pub async fn callback(
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+) -> Response {
     let provider = match params.get("provider") {
-        Some(provider) => provider,
-        None => {
-            return (StatusCode::BAD_REQUEST, "No provider specified".to_string()).into_response()
-        }
+        Some(provider) => provider.to_string(),
+        None => match env::var("OAUTH_PROVIDER") {
+            Ok(var) => var,
+            Err(_) => {
+                return (StatusCode::BAD_REQUEST, "No provider specified".to_string())
+                    .into_response()
+            }
+        },
     };
-
-    if provider != "github" {
-        return (
-            StatusCode::BAD_REQUEST,
-            format!("Invalid provider {:?}", provider),
-        )
-            .into_response();
-    }
 
     let code = match params.get("code") {
         Some(code) => AuthorizationCode::new(code.to_string()),
         None => return (StatusCode::BAD_REQUEST, "Code is required".to_string()).into_response(),
     };
 
-    let client = create_client();
+    let host = match headers.get("host") {
+        Some(host) => host.to_str().unwrap(),
+        None => return (StatusCode::BAD_REQUEST, "No host header".to_string()).into_response(),
+    };
+
+    let redirect_url = format!("https://{}/callback?provider={}", host, provider);
+
+    let client = create_client(redirect_url);
 
     match client.exchange_code(code).request(http_client) {
         Ok(token) => (
             StatusCode::OK,
-            login_response(provider, "success", token.access_token()),
+            login_response(&provider, "success", token.access_token()),
         )
             .into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => {
+            eprintln!("{:?}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+        }
     }
 }
 

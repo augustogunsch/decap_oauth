@@ -1,8 +1,23 @@
-Decap CMS OAuth provider for GitHub. The following environment variables must
-be set for it to work properly: `ORIGIN`, `CLIENT_ID`  and `SECRET`. For
-instructions on how to set up an OAuth app and get `CLIENT_ID` and `SECRET`,
-refer to [GitHub's
-documentation](https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/creating-an-oauth-app).
+External OAuth provider for Decap CMS. The following environment variables must be set for it to
+work:
 
+```shell
+OAUTH_CLIENT_ID=(insert_the_client_id)
+OAUTH_SECRET=(insert_the_secret)
+OAUTH_ORIGINS=www.example.com,oauth.mysite.com
+```
+
+Additionaly, when using a host provider other than GitHub, such as Gitlab, the following
+environment variables must be set:
+
+```shell
+OAUTH_PROVIDER=gitlab
+OAUTH_HOSTNAME=https://gitlab.com
+OAUTH_TOKEN_PATH=/oauth/token
+OAUTH_AUTHORIZE_PATH=/oauth/authorize
+OAUTH_SCOPES=api
+```
+
+When using GitHub Enterprise, please set `OAUTH_HOSTNAME` to the proper value.
 
 Documentation available on [docs.rs](https://docs.rs/decap_oauth/latest/decap_oauth/).
