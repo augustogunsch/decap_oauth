@@ -27,7 +27,7 @@ use axum::{
     routing, Router,
 };
 use oauth2::{
-    basic::BasicClient, reqwest::http_client, AccessToken, AuthUrl, AuthorizationCode, ClientId,
+    basic::BasicClient, reqwest::async_http_client, AccessToken, AuthUrl, AuthorizationCode, ClientId,
     ClientSecret, CsrfToken, RedirectUrl, Scope, TokenResponse, TokenUrl,
 };
 use std::collections::HashMap;
@@ -183,7 +183,7 @@ pub async fn callback(
 
     let client = create_client(redirect_url);
 
-    match client.exchange_code(code).request(http_client) {
+    match client.exchange_code(code).request_async(async_http_client).await {
         Ok(token) => (
             StatusCode::OK,
             login_response(&provider, "success", token.access_token()),
