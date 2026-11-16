@@ -1,0 +1,7 @@
+target/
+.git/
+.github/
+Dockerfile
+Justfile
+README.md
+LICENSE

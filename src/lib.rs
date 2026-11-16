@@ -27,11 +27,12 @@ use axum::{
     routing, Router,
 };
 use oauth2::{
-    basic::BasicClient, reqwest::async_http_client, AccessToken, AuthUrl, AuthorizationCode, ClientId,
-    ClientSecret, CsrfToken, RedirectUrl, Scope, TokenResponse, TokenUrl,
+    basic::BasicClient, AccessToken, AuthUrl, AuthorizationCode, ClientId, ClientSecret, CsrfToken,
+    RedirectUrl, Scope, TokenResponse, TokenUrl,
 };
 use std::collections::HashMap;
 use std::env;
+use std::sync::LazyLock;
 
 const OAUTH_HOSTNAME: &str = "https://github.com";
 const OAUTH_TOKEN_PATH: &str = "/login/oauth/access_token";
@@ -39,31 +40,51 @@ const OAUTH_AUTHORIZE_PATH: &str = "/login/oauth/authorize";
 const OAUTH_PROVIDER: &str = "github";
 const OAUTH_SCOPES: &str = "repo";
 
+/// Shared token-exchange client. Redirects are disabled because following them
+/// on a token request would allow a malicious provider to be used as an SSRF
+/// proxy (see the `oauth2` crate documentation).
+static HTTP_CLIENT: LazyLock<oauth2::reqwest::Client> = LazyLock::new(|| {
+    oauth2::reqwest::ClientBuilder::new()
+        .redirect(oauth2::reqwest::redirect::Policy::none())
+        .build()
+        .expect("HTTP client should build")
+});
+
 fn get_var(var: &str) -> String {
-    env::var(var).expect(format!("{} environment variable should be defined", var).as_str())
+    env::var(var).unwrap_or_else(|_| panic!("{} environment variable should be defined", var))
 }
 
 fn get_var_or(var: &str, default: &str) -> String {
     env::var(var).unwrap_or(default.to_string())
 }
 
-fn create_client(redirect_url: String) -> BasicClient {
+/// The client has an authorization and a token endpoint configured, hence the
+/// typestate parameters.
+type OAuthClient = BasicClient<
+    oauth2::EndpointSet,
+    oauth2::EndpointNotSet,
+    oauth2::EndpointNotSet,
+    oauth2::EndpointNotSet,
+    oauth2::EndpointSet,
+>;
+
+fn create_client(redirect_url: String) -> OAuthClient {
     let client_id = get_var("OAUTH_CLIENT_ID");
     let secret = get_var("OAUTH_SECRET");
     let hostname = get_var_or("OAUTH_HOSTNAME", OAUTH_HOSTNAME);
     let token_path = get_var_or("OAUTH_TOKEN_PATH", OAUTH_TOKEN_PATH);
     let auth_path = get_var_or("OAUTH_AUTHORIZE_PATH", OAUTH_AUTHORIZE_PATH);
 
-    BasicClient::new(
-        ClientId::new(client_id),
-        Some(ClientSecret::new(secret)),
-        AuthUrl::new(format!("{}{}", hostname, auth_path)).expect("Auth URL should be a valid URL"),
-        Some(
-            TokenUrl::new(format!("{}{}", hostname, token_path))
-                .expect("Token URL should be a valid URL"),
-        ),
-    )
-    .set_redirect_uri(RedirectUrl::new(redirect_url).expect("Invalid redirect URL"))
+    let auth_url =
+        AuthUrl::new(format!("{}{}", hostname, auth_path)).expect("Auth URL should be a valid URL");
+    let token_url = TokenUrl::new(format!("{}{}", hostname, token_path))
+        .expect("Token URL should be a valid URL");
+
+    BasicClient::new(ClientId::new(client_id))
+        .set_client_secret(ClientSecret::new(secret))
+        .set_auth_uri(auth_url)
+        .set_token_uri(token_url)
+        .set_redirect_uri(RedirectUrl::new(redirect_url).expect("Invalid redirect URL"))
 }
 
 /// The auth route.
@@ -109,7 +130,7 @@ pub async fn auth(Query(params): Query<HashMap<String, String>>, headers: Header
         .add_scope(Scope::new(scope))
         .url();
 
-    Redirect::to(&auth_url.to_string()).into_response()
+    Redirect::to(auth_url.as_str()).into_response()
 }
 
 fn login_response(provider: &str, status: &str, token: &AccessToken) -> Html<String> {
@@ -183,7 +204,11 @@ pub async fn callback(
 
     let client = create_client(redirect_url);
 
-    match client.exchange_code(code).request_async(async_http_client).await {
+    match client
+        .exchange_code(code)
+        .request_async(&*HTTP_CLIENT)
+        .await
+    {
         Ok(token) => (
             StatusCode::OK,
             login_response(&provider, "success", token.access_token()),
