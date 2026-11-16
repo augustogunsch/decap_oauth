@@ -38,7 +38,7 @@ fn parse_args() -> Args {
 }
 
 fn check_var(var: &str) {
-    if let Err(_) = env::var(var) {
+    if env::var(var).is_err() {
         eprintln!("error: undefined environment variable `{}`.", var);
         exit(1);
     }
