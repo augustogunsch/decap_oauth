@@ -1,5 +1,5 @@
 docker-image := "ghcr.io/somniumensemble/decap_oauth"
-docker-tag := "v0.0.2"
+docker-tag := "v0.0.3"
 
 default:
     @just --list

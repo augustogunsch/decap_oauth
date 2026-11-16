@@ -19,6 +19,12 @@
 //! ```
 //!
 //! When using GitHub Enterprise, please set `OAUTH_HOSTNAME` to the proper value.
+//!
+//! The redirect URI sent to the provider is derived from the request's `Host`
+//! header and `X-Forwarded-Proto`, so running behind a TLS-terminating reverse
+//! proxy works without further configuration. Set `PUBLIC_URL` (for example
+//! `https://www.example.com`) to override that detection, which is required
+//! when the proxy rewrites the `Host` header.
 
 use axum::{
     extract::Query,
@@ -58,6 +64,44 @@ fn get_var_or(var: &str, default: &str) -> String {
     env::var(var).unwrap_or(default.to_string())
 }
 
+/// Provider requested by this authorization, falling back to the configured one.
+fn provider_from(params: &HashMap<String, String>) -> String {
+    params
+        .get("provider")
+        .cloned()
+        .unwrap_or_else(|| get_var_or("OAUTH_PROVIDER", OAUTH_PROVIDER))
+}
+
+/// Base URL (`scheme://host`) the browser used to reach this service.
+///
+/// The service normally sits behind a reverse proxy that terminates TLS and
+/// forwards the request over plain HTTP, so the scheme has to come from
+/// `X-Forwarded-Proto`. `PUBLIC_URL` overrides host detection entirely.
+fn base_url(headers: &HeaderMap, public_url: Option<&str>) -> Option<String> {
+    if let Some(url) = public_url {
+        let url = url.trim().trim_end_matches('/');
+        if !url.is_empty() {
+            return Some(url.to_string());
+        }
+    }
+
+    let host = headers.get("host")?.to_str().ok()?;
+    let scheme = headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .map(str::trim)
+        .filter(|value| *value == "http" || *value == "https")
+        .unwrap_or("https");
+
+    Some(format!("{}://{}", scheme, host))
+}
+
+fn public_base_url(headers: &HeaderMap) -> Option<String> {
+    let public_url = env::var("PUBLIC_URL").ok();
+    base_url(headers, public_url.as_deref())
+}
+
 /// The client has an authorization and a token endpoint configured, hence the
 /// typestate parameters.
 type OAuthClient = BasicClient<
@@ -91,16 +135,7 @@ fn create_client(redirect_url: String) -> OAuthClient {
 pub async fn auth(Query(params): Query<HashMap<String, String>>, headers: HeaderMap) -> Response {
     let expected_provider = get_var_or("OAUTH_PROVIDER", OAUTH_PROVIDER);
 
-    let provider = match params.get("provider") {
-        Some(provider) => provider.to_string(),
-        None => match env::var("OAUTH_PROVIDER") {
-            Ok(var) => var,
-            Err(_) => {
-                return (StatusCode::BAD_REQUEST, "No provider specified".to_string())
-                    .into_response()
-            }
-        },
-    };
+    let provider = provider_from(&params);
 
     // This check is not strictly needed
     if provider != expected_provider {
@@ -116,12 +151,20 @@ pub async fn auth(Query(params): Query<HashMap<String, String>>, headers: Header
         None => get_var_or("OAUTH_SCOPES", OAUTH_SCOPES),
     };
 
-    let host = match headers.get("host") {
-        Some(host) => host.to_str().unwrap(),
-        None => return (StatusCode::BAD_REQUEST, "No host header".to_string()).into_response(),
+    let base = match public_base_url(&headers) {
+        Some(base) => base,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "Cannot determine public URL".to_string(),
+            )
+                .into_response()
+        }
     };
 
-    let redirect_url = format!("https://{}/callback?provider={}", host, provider);
+    // No query string: providers compare the redirect URI against the
+    // registered callback URL, and an extra parameter breaks that match.
+    let redirect_url = format!("{}/callback", base);
 
     let client = create_client(redirect_url);
 
@@ -179,28 +222,26 @@ pub async fn callback(
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Response {
-    let provider = match params.get("provider") {
-        Some(provider) => provider.to_string(),
-        None => match env::var("OAUTH_PROVIDER") {
-            Ok(var) => var,
-            Err(_) => {
-                return (StatusCode::BAD_REQUEST, "No provider specified".to_string())
-                    .into_response()
-            }
-        },
-    };
+    let provider = provider_from(&params);
 
     let code = match params.get("code") {
         Some(code) => AuthorizationCode::new(code.to_string()),
         None => return (StatusCode::BAD_REQUEST, "Code is required".to_string()).into_response(),
     };
 
-    let host = match headers.get("host") {
-        Some(host) => host.to_str().unwrap(),
-        None => return (StatusCode::BAD_REQUEST, "No host header".to_string()).into_response(),
+    let base = match public_base_url(&headers) {
+        Some(base) => base,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "Cannot determine public URL".to_string(),
+            )
+                .into_response()
+        }
     };
 
-    let redirect_url = format!("https://{}/callback?provider={}", host, provider);
+    // Must be byte-for-byte what the authorization request used.
+    let redirect_url = format!("{}/callback", base);
 
     let client = create_client(redirect_url);
 
@@ -226,4 +267,71 @@ pub fn oauth_router() -> Router {
     Router::new()
         .route("/auth", routing::get(auth))
         .route("/callback", routing::get(callback))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::HeaderValue;
+
+    fn headers(host: Option<&str>, proto: Option<&str>) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        if let Some(host) = host {
+            map.insert("host", HeaderValue::from_str(host).unwrap());
+        }
+        if let Some(proto) = proto {
+            map.insert("x-forwarded-proto", HeaderValue::from_str(proto).unwrap());
+        }
+        map
+    }
+
+    #[test]
+    fn public_url_takes_precedence_and_loses_trailing_slash() {
+        let map = headers(Some("localhost:8080"), Some("http"));
+        assert_eq!(
+            base_url(&map, Some("https://example.com/")).as_deref(),
+            Some("https://example.com")
+        );
+    }
+
+    #[test]
+    fn empty_public_url_is_ignored() {
+        let map = headers(Some("example.com"), None);
+        assert_eq!(
+            base_url(&map, Some("  ")).as_deref(),
+            Some("https://example.com")
+        );
+    }
+
+    #[test]
+    fn forwarded_proto_is_honoured() {
+        let map = headers(Some("localhost:8080"), Some("http"));
+        assert_eq!(
+            base_url(&map, None).as_deref(),
+            Some("http://localhost:8080")
+        );
+    }
+
+    #[test]
+    fn scheme_defaults_to_https() {
+        let map = headers(Some("example.com"), None);
+        assert_eq!(base_url(&map, None).as_deref(), Some("https://example.com"));
+    }
+
+    #[test]
+    fn unexpected_scheme_falls_back_to_https() {
+        let map = headers(Some("example.com"), Some("gopher"));
+        assert_eq!(base_url(&map, None).as_deref(), Some("https://example.com"));
+    }
+
+    #[test]
+    fn first_value_of_a_forwarded_chain_is_used() {
+        let map = headers(Some("example.com"), Some("https, http"));
+        assert_eq!(base_url(&map, None).as_deref(), Some("https://example.com"));
+    }
+
+    #[test]
+    fn missing_host_has_no_base_url() {
+        assert_eq!(base_url(&headers(None, None), None), None);
+    }
 }
