@@ -24,7 +24,8 @@
 //! header and `X-Forwarded-Proto`, so running behind a TLS-terminating reverse
 //! proxy works without further configuration. Set `PUBLIC_URL` (for example
 //! `https://www.example.com`) to override that detection, which is required
-//! when the proxy rewrites the `Host` header.
+//! when the proxy rewrites the `Host` header. `PUBLIC_URL` must be an origin:
+//! a scheme and a host, with no path, query or fragment.
 
 use axum::{
     extract::Query,
@@ -72,27 +73,54 @@ fn provider_from(params: &HashMap<String, String>) -> String {
         .unwrap_or_else(|| get_var_or("OAUTH_PROVIDER", OAUTH_PROVIDER))
 }
 
+/// Validate an operator-provided `PUBLIC_URL`.
+///
+/// Only an absolute `http(s)` origin is usable: the scheme and host are kept,
+/// and a trailing slash is dropped. Anything with a path, query or fragment is
+/// rejected rather than silently producing a callback URL that the provider
+/// will not match against the registered one.
+pub fn normalize_public_url(raw: &str) -> Option<String> {
+    let url = raw.trim().trim_end_matches('/');
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))?;
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+
+    if authority.is_empty()
+        || authority.len() != rest.len()
+        || authority.contains(char::is_whitespace)
+    {
+        return None;
+    }
+
+    Some(url.to_string())
+}
+
 /// Base URL (`scheme://host`) the browser used to reach this service.
 ///
 /// The service normally sits behind a reverse proxy that terminates TLS and
 /// forwards the request over plain HTTP, so the scheme has to come from
 /// `X-Forwarded-Proto`. `PUBLIC_URL` overrides host detection entirely.
 fn base_url(headers: &HeaderMap, public_url: Option<&str>) -> Option<String> {
-    if let Some(url) = public_url {
-        let url = url.trim().trim_end_matches('/');
-        if !url.is_empty() {
-            return Some(url.to_string());
-        }
+    if let Some(url) = public_url.and_then(normalize_public_url) {
+        return Some(url);
     }
 
     let host = headers.get("host")?.to_str().ok()?;
+    if host.is_empty() || host.contains(char::is_whitespace) {
+        return None;
+    }
+
+    // Scheme tokens are case-insensitive; proxies are not guaranteed to
+    // forward them lowercased.
     let scheme = headers
         .get("x-forwarded-proto")
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.split(',').next())
         .map(str::trim)
-        .filter(|value| *value == "http" || *value == "https")
-        .unwrap_or("https");
+        .map(str::to_ascii_lowercase)
+        .filter(|value| value == "http" || value == "https")
+        .unwrap_or_else(|| "https".to_string());
 
     Some(format!("{}://{}", scheme, host))
 }
@@ -100,6 +128,14 @@ fn base_url(headers: &HeaderMap, public_url: Option<&str>) -> Option<String> {
 fn public_base_url(headers: &HeaderMap) -> Option<String> {
     let public_url = env::var("PUBLIC_URL").ok();
     base_url(headers, public_url.as_deref())
+}
+
+/// Callback URL registered with the provider.
+///
+/// Must be byte-for-byte what the authorization request used, and must not
+/// carry extra parameters: providers compare it against the registered URL.
+fn callback_url(base: &str) -> String {
+    format!("{}/callback", base)
 }
 
 /// The client has an authorization and a token endpoint configured, hence the
@@ -112,7 +148,7 @@ type OAuthClient = BasicClient<
     oauth2::EndpointSet,
 >;
 
-fn create_client(redirect_url: String) -> OAuthClient {
+fn create_client(redirect_url: String) -> Result<OAuthClient, String> {
     let client_id = get_var("OAUTH_CLIENT_ID");
     let secret = get_var("OAUTH_SECRET");
     let hostname = get_var_or("OAUTH_HOSTNAME", OAUTH_HOSTNAME);
@@ -120,15 +156,16 @@ fn create_client(redirect_url: String) -> OAuthClient {
     let auth_path = get_var_or("OAUTH_AUTHORIZE_PATH", OAUTH_AUTHORIZE_PATH);
 
     let auth_url =
-        AuthUrl::new(format!("{}{}", hostname, auth_path)).expect("Auth URL should be a valid URL");
-    let token_url = TokenUrl::new(format!("{}{}", hostname, token_path))
-        .expect("Token URL should be a valid URL");
+        AuthUrl::new(format!("{}{}", hostname, auth_path)).map_err(|error| error.to_string())?;
+    let token_url =
+        TokenUrl::new(format!("{}{}", hostname, token_path)).map_err(|error| error.to_string())?;
+    let redirect_url = RedirectUrl::new(redirect_url).map_err(|error| error.to_string())?;
 
-    BasicClient::new(ClientId::new(client_id))
+    Ok(BasicClient::new(ClientId::new(client_id))
         .set_client_secret(ClientSecret::new(secret))
         .set_auth_uri(auth_url)
         .set_token_uri(token_url)
-        .set_redirect_uri(RedirectUrl::new(redirect_url).expect("Invalid redirect URL"))
+        .set_redirect_uri(redirect_url))
 }
 
 /// The auth route.
@@ -164,9 +201,12 @@ pub async fn auth(Query(params): Query<HashMap<String, String>>, headers: Header
 
     // No query string: providers compare the redirect URI against the
     // registered callback URL, and an extra parameter breaks that match.
-    let redirect_url = format!("{}/callback", base);
+    let redirect_url = callback_url(&base);
 
-    let client = create_client(redirect_url);
+    let client = match create_client(redirect_url) {
+        Ok(client) => client,
+        Err(message) => return (StatusCode::INTERNAL_SERVER_ERROR, message).into_response(),
+    };
 
     let (auth_url, _csrf_state) = client
         .authorize_url(CsrfToken::new_random)
@@ -176,23 +216,47 @@ pub async fn auth(Query(params): Query<HashMap<String, String>>, headers: Header
     Redirect::to(auth_url.as_str()).into_response()
 }
 
+/// `OAUTH_ORIGINS` as a JSON array literal for the postMessage handshake.
+///
+/// Entries are restricted to characters that can appear in a host or an
+/// origin, so a typo in the configuration cannot inject JavaScript. Entries
+/// may be a bare host (`example.com`, `localhost:8080`) or a full origin.
+fn origin_allow_list(raw: &str) -> String {
+    let entries: Vec<String> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| {
+            !entry.is_empty()
+                && entry.chars().all(|c| {
+                    c.is_ascii_alphanumeric() || matches!(c, '.' | ':' | '-' | '[' | ']' | '/')
+                })
+        })
+        .map(|entry| format!("\"{}\"", entry))
+        .collect();
+
+    format!("[{}]", entries.join(","))
+}
+
 fn login_response(provider: &str, status: &str, token: &AccessToken) -> Html<String> {
-    let origins = get_var("OAUTH_ORIGINS");
+    let origins = origin_allow_list(&get_var("OAUTH_ORIGINS"));
 
     Html(format!(
         r#"
     <script>
-      const receiveMessage = (e) => {{
-        let matches = false;
-
-        for(const origin of '{}'.split(',')) {{
-          if (e.origin.match(origin)) {{
-              matches = true;
-              break;
-          }}
+      const allowedOrigins = {};
+      const matchesOrigin = (origin) => {{
+        try {{
+          const url = new URL(origin);
+          return allowedOrigins.some(
+            (allowed) => allowed === origin || allowed === url.host || allowed === url.hostname
+          );
+        }} catch (error) {{
+          return false;
         }}
+      }};
 
-        if (!matches) {{
+      const receiveMessage = (e) => {{
+        if (!matchesOrigin(e.origin)) {{
           return;
         }}
 
@@ -241,9 +305,12 @@ pub async fn callback(
     };
 
     // Must be byte-for-byte what the authorization request used.
-    let redirect_url = format!("{}/callback", base);
+    let redirect_url = callback_url(&base);
 
-    let client = create_client(redirect_url);
+    let client = match create_client(redirect_url) {
+        Ok(client) => client,
+        Err(message) => return (StatusCode::INTERNAL_SERVER_ERROR, message).into_response(),
+    };
 
     match client
         .exchange_code(code)
@@ -295,6 +362,35 @@ mod tests {
     }
 
     #[test]
+    fn public_url_without_a_scheme_is_rejected() {
+        let map = headers(Some("example.com"), None);
+        assert_eq!(
+            base_url(&map, Some("example.com")).as_deref(),
+            Some("https://example.com")
+        );
+    }
+
+    #[test]
+    fn public_url_with_a_path_is_rejected() {
+        let map = headers(Some("example.com"), None);
+        assert_eq!(
+            base_url(&map, Some("https://example.com/sub")).as_deref(),
+            Some("https://example.com")
+        );
+        assert_eq!(
+            base_url(&map, Some("https://example.com?x=1")).as_deref(),
+            Some("https://example.com")
+        );
+    }
+
+    #[test]
+    fn public_url_of_the_wrong_scheme_is_rejected() {
+        assert_eq!(normalize_public_url("ftp://example.com"), None);
+        assert_eq!(normalize_public_url(""), None);
+        assert_eq!(normalize_public_url("   "), None);
+    }
+
+    #[test]
     fn empty_public_url_is_ignored() {
         let map = headers(Some("example.com"), None);
         assert_eq!(
@@ -306,6 +402,15 @@ mod tests {
     #[test]
     fn forwarded_proto_is_honoured() {
         let map = headers(Some("localhost:8080"), Some("http"));
+        assert_eq!(
+            base_url(&map, None).as_deref(),
+            Some("http://localhost:8080")
+        );
+    }
+
+    #[test]
+    fn forwarded_proto_is_case_insensitive() {
+        let map = headers(Some("localhost:8080"), Some("HTTP"));
         assert_eq!(
             base_url(&map, None).as_deref(),
             Some("http://localhost:8080")
@@ -333,5 +438,42 @@ mod tests {
     #[test]
     fn missing_host_has_no_base_url() {
         assert_eq!(base_url(&headers(None, None), None), None);
+    }
+
+    #[test]
+    fn unusable_host_has_no_base_url() {
+        assert_eq!(base_url(&headers(Some("a b"), None), None), None);
+        assert_eq!(base_url(&headers(Some(""), None), None), None);
+    }
+
+    #[test]
+    fn callback_url_carries_no_query_string() {
+        assert_eq!(
+            callback_url("https://example.com"),
+            "https://example.com/callback"
+        );
+        assert!(!callback_url("https://example.com").contains('?'));
+    }
+
+    #[test]
+    fn origin_allow_list_is_a_json_array() {
+        assert_eq!(
+            origin_allow_list("localhost:8080, dev.example.com"),
+            r#"["localhost:8080","dev.example.com"]"#
+        );
+        assert_eq!(origin_allow_list(""), "[]");
+        assert_eq!(origin_allow_list(" , ,"), "[]");
+    }
+
+    #[test]
+    fn origin_allow_list_drops_entries_that_could_inject_script() {
+        assert_eq!(
+            origin_allow_list(r#"example.com'); alert(1);//, good.example"#),
+            r#"["good.example"]"#
+        );
+        assert_eq!(
+            origin_allow_list(r#"https://example.com"#),
+            r#"["https://example.com"]"#
+        );
     }
 }
