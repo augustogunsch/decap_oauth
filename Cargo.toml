@@ -14,3 +14,4 @@ axum = "0.7"
 oauth2 = "4"
 reqwest = "0.11"
 tokio = { version = "1", features = ["full"] }
+openssl = { version = "0.10", features = ["vendored"] }
